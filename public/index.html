@@ -163,6 +163,18 @@
         <button id="readButton" type="submit">Read GitHub file</button>
       </form>
 
+      <div class="grid" style="margin-top: 12px;">
+        <div>
+          <label for="repositoryFiles">Files in repository</label>
+          <select id="repositoryFiles">
+            <option value="">Load repository files first</option>
+          </select>
+        </div>
+        <div style="align-self: end;">
+          <button id="listFilesButton" type="button">Load repository files</button>
+        </div>
+      </div>
+
       <div id="githubStatus" class="status" role="status"></div>
 
       <div id="sourceResult" class="result">
@@ -285,6 +297,60 @@
       }
       return data;
     }
+
+    byId("listFilesButton").addEventListener("click", async () => {
+      const repository = byId("repository").value.trim();
+      const branch = byId("branch").value.trim() || "main";
+      const selector = byId("repositoryFiles");
+
+      if (!repository) {
+        showStatus("githubStatus", "Enter a repository in owner/repository format.", "error");
+        return;
+      }
+
+      setBusy("listFilesButton", true, "Loading files...", "Load repository files");
+      showStatus("githubStatus", "Loading repository file list...");
+
+      try {
+        const params = new URLSearchParams({ repository, branch });
+        const response = await fetch("/api/github-files?" + params.toString());
+        const data = await readJson(response);
+
+        selector.replaceChildren();
+
+        for (const file of data.files || []) {
+          const option = document.createElement("option");
+          option.value = file.path;
+          option.textContent = file.path;
+          selector.appendChild(option);
+        }
+
+        if (!selector.options.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No files found";
+          selector.appendChild(option);
+        }
+
+        showStatus(
+          "githubStatus",
+          "Found " + (data.count ?? selector.options.length) +
+            " files in " + repository + " (" + branch + "). Select a file, then click Read GitHub file.",
+          "success"
+        );
+      } catch (error) {
+        showStatus("githubStatus", error.message, "error");
+      } finally {
+        setBusy("listFilesButton", false, "", "Load repository files");
+      }
+    });
+
+    byId("repositoryFiles").addEventListener("change", () => {
+      const selectedPath = byId("repositoryFiles").value;
+      if (selectedPath) {
+        byId("filePath").value = selectedPath;
+      }
+    });
 
     byId("githubForm").addEventListener("submit", async (event) => {
       event.preventDefault();
