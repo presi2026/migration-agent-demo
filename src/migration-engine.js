@@ -228,7 +228,21 @@ class MigrationEngine {
           : "Migration failed.";
     }
 
+    if (nextStatus === "queued") {
+      job.progress = 0;
+      job.error = null;
+    }
+
     if (nextStatus === "running") {
+      job.error = null;
+    }
+
+    if (
+      nextStatus === "queued" &&
+      Number.isInteger(details.progress) &&
+      details.progress === 0
+    ) {
+      job.progress = 0;
       job.error = null;
     }
 

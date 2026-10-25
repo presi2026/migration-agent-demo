@@ -64,10 +64,8 @@ function isEligiblePath(filePath, sourceLanguage) {
     return false;
   }
 
-  const lowerPath = filePath.toLowerCase();
-
   return extensions.some((extension) =>
-    lowerPath.endsWith(extension)
+    filePath.toLowerCase().endsWith(extension)
   );
 }
 
@@ -76,7 +74,7 @@ function normalizeScope(files) {
     throw new Error("Migration scope must be an array.");
   }
 
-  return files.map((file) => {
+  const paths = files.map((file) => {
     const filePath =
       typeof file === "string" ? file : file?.filePath;
 
@@ -85,15 +83,40 @@ function normalizeScope(files) {
       !filePath.trim() ||
       filePath.startsWith("/") ||
       filePath.includes("\\") ||
+      filePath.includes("\0") ||
+      /^[a-zA-Z]:/.test(filePath) ||
       filePath.split("/").some(
         (part) => !part || part === "." || part === ".."
       )
     ) {
-      throw new Error("Migration scope contains an invalid file path.");
+      throw new Error(
+        "Migration scope contains an invalid file path."
+      );
     }
 
     return filePath;
   });
+
+  if (new Set(paths).size !== paths.length) {
+    throw new Error(
+      "Migration scope contains duplicate file paths."
+    );
+  }
+
+  return paths;
+}
+
+function normalizeProposal(proposal) {
+  if (typeof proposal !== "string") {
+    return proposal;
+  }
+
+  const trimmed = proposal.trim();
+  const match = trimmed.match(
+    /^```[a-zA-Z0-9_+-]*[ 	]*\r?\n([\s\S]*?)\r?\n```$/
+  );
+
+  return match ? match[1].trim() + "\n" : proposal;
 }
 
 class AutonomousRunner {
@@ -123,7 +146,11 @@ class AutonomousRunner {
       }
     }
 
-    if (!Number.isInteger(maxFiles) || maxFiles < 1 || maxFiles > 100) {
+    if (
+      !Number.isInteger(maxFiles) ||
+      maxFiles < 1 ||
+      maxFiles > 100
+    ) {
       throw new Error("maxFiles must be between 1 and 100.");
     }
 
@@ -150,7 +177,22 @@ class AutonomousRunner {
   }
 
   cancel(jobId) {
-    this.cancelled.add(jobId);
+    if (this.active.has(jobId)) {
+      this.cancelled.add(jobId);
+      return true;
+    }
+
+    const job = this.engine.getJob(jobId);
+
+    if (
+      job?.status === "queued" ||
+      job?.status === "awaiting_approval"
+    ) {
+      this.engine.transitionJob(jobId, "cancelled");
+      return true;
+    }
+
+    return false;
   }
 
   checkCancelled(jobId) {
@@ -175,12 +217,28 @@ class AutonomousRunner {
 
   async execute(jobId) {
     if (this.active.has(jobId)) {
-      throw new Error("This migration job is already executing.");
+      throw new Error(
+        "This migration job is already executing."
+      );
     }
 
     this.active.add(jobId);
 
     try {
+      const job = this.engine.getJob(jobId);
+
+      if (!job) {
+        throw new Error("Migration job not found.");
+      }
+
+      if (job.status === "queued") {
+        this.engine.transitionJob(jobId, "running");
+      } else if (job.status !== "running") {
+        throw new Error(
+          `Only queued or running jobs can execute (current status: ${job.status}).`
+        );
+      }
+
       return await this.run(jobId);
     } finally {
       this.active.delete(jobId);
@@ -191,7 +249,6 @@ class AutonomousRunner {
   async run(jobId) {
     try {
       let job = this.checkCancelled(jobId);
-
       this.engine.updateProgress(jobId, 5);
 
       const requestedScope = normalizeScope(job.files || []);
@@ -200,7 +257,9 @@ class AutonomousRunner {
       this.checkCancelled(jobId);
 
       if (!Array.isArray(discovered)) {
-        throw new Error("Repository discovery returned invalid data.");
+        throw new Error(
+          "Repository discovery returned invalid data."
+        );
       }
 
       const discoveredPaths = new Set(
@@ -217,7 +276,7 @@ class AutonomousRunner {
       let selectedPaths;
 
       if (requestedScope.length > 0) {
-        selectedPaths = [...new Set(requestedScope)];
+        selectedPaths = requestedScope;
 
         const missing = selectedPaths.filter(
           (filePath) => !discoveredPaths.has(filePath)
@@ -247,16 +306,19 @@ class AutonomousRunner {
 
       const proposals = [];
 
-      for (let index = 0; index < selectedPaths.length; index += 1) {
+      for (
+        let index = 0;
+        index < selectedPaths.length;
+        index += 1
+      ) {
         this.checkCancelled(jobId);
 
         const filePath = selectedPaths[index];
         const source = await this.readFile(job, filePath);
 
-        if (
-          !source ||
-          typeof source.content !== "string"
-        ) {
+        this.checkCancelled(jobId);
+
+        if (!source || typeof source.content !== "string") {
           throw new Error(
             `Unable to read source file: ${filePath}`
           );
@@ -277,6 +339,9 @@ class AutonomousRunner {
           filePath,
           sourceCode: source.content,
         });
+        proposal = normalizeProposal(proposal);
+
+        this.checkCancelled(jobId);
 
         if (
           typeof proposal !== "string" ||
@@ -292,6 +357,7 @@ class AutonomousRunner {
           filePath,
           sourceCode: source.content,
           proposal,
+          targetLanguage: job.targetLanguage,
         });
 
         let repairAttempts = 0;
@@ -301,7 +367,6 @@ class AutonomousRunner {
           repairAttempts < this.maxRepairAttempts
         ) {
           this.checkCancelled(jobId);
-
           repairAttempts += 1;
 
           proposal = await this.generateProposal({
@@ -313,6 +378,10 @@ class AutonomousRunner {
             validationErrors: validation?.errors || [],
             repairAttempt: repairAttempts,
           });
+
+          proposal = normalizeProposal(proposal);
+
+          this.checkCancelled(jobId);
 
           if (
             typeof proposal !== "string" ||
@@ -328,6 +397,7 @@ class AutonomousRunner {
             filePath,
             sourceCode: source.content,
             proposal,
+            targetLanguage: job.targetLanguage,
           });
         }
 
@@ -336,7 +406,7 @@ class AutonomousRunner {
           sourceSha: source.sha || null,
           proposal,
           validation: {
-            success: Boolean(validation?.success),
+            success: validation?.success === true,
             errors: Array.isArray(validation?.errors)
               ? validation.errors
               : [],
@@ -351,9 +421,11 @@ class AutonomousRunner {
           proposals: structuredClone(proposals),
         });
 
-        const progress = 10 + Math.floor(
-          ((index + 1) / selectedPaths.length) * 65
-        );
+        const progress =
+          10 +
+          Math.floor(
+            ((index + 1) / selectedPaths.length) * 65
+          );
 
         this.engine.updateProgress(
           jobId,
@@ -376,40 +448,14 @@ class AutonomousRunner {
 
       this.engine.updateProgress(jobId, 80);
 
-      const publication = await this.publish({
-        job,
-        proposals,
-      });
-
-      this.checkCancelled(jobId);
-
-      if (
-        !publication ||
-        typeof publication.branch !== "string" ||
-        !publication.branch
-      ) {
-        throw new Error(
-          "Publication did not return a valid branch."
-        );
-      }
-
-      const details = {
-        branch: publication.branch,
-        changesApplied: true,
-      };
-
-      if (publication.pullRequest) {
-        details.pullRequest = publication.pullRequest;
-      }
-
-      this.engine.updateJobDetails(jobId, details);
-
-      this.engine.updateProgress(jobId, 95);
-
-      job = this.engine.transitionJob(jobId, "completed");
+      job = this.engine.transitionJob(
+        jobId,
+        "awaiting_approval"
+      );
 
       return {
         success: true,
+        awaitingApproval: true,
         job,
         filesMigrated: proposals.length,
         validationPassed: true,
@@ -417,7 +463,7 @@ class AutonomousRunner {
     } catch (error) {
       const current = this.engine.getJob(jobId);
 
-      if (current && current.status === "running") {
+      if (current?.status === "running") {
         if (
           this.cancelled.has(jobId) &&
           error.message === "Migration cancelled."
@@ -434,6 +480,107 @@ class AutonomousRunner {
       }
 
       throw error;
+    }
+  }
+
+  async publishApproved(jobId) {
+    if (this.active.has(jobId)) {
+      throw new Error(
+        "This migration job is already executing."
+      );
+    }
+
+    this.active.add(jobId);
+    let transitionedToRunning = false;
+
+    try {
+      let job = this.engine.getJob(jobId);
+
+      if (!job) {
+        throw new Error("Migration job not found.");
+      }
+
+      if (job.status !== "awaiting_approval") {
+        throw new Error(
+          "Only jobs awaiting approval can be published."
+        );
+      }
+
+      const proposals = job.proposals || [];
+
+      if (
+        proposals.length === 0 ||
+        proposals.some(
+          (item) => item.validation?.success !== true
+        )
+      ) {
+        throw new Error(
+          "Cannot publish empty or unvalidated migration proposals."
+        );
+      }
+
+      this.engine.updateJobDetails(jobId, {
+        approvedAt: new Date().toISOString(),
+      });
+
+      job = this.engine.transitionJob(jobId, "running");
+      transitionedToRunning = true;
+
+      this.engine.updateProgress(jobId, 85);
+
+      const publication = await this.publish({
+        job,
+        proposals,
+      });
+
+      if (
+        !publication ||
+        typeof publication.branch !== "string" ||
+        !publication.branch.trim()
+      ) {
+        throw new Error(
+          "Publication did not return a valid branch."
+        );
+      }
+
+      const details = {
+        branch: publication.branch,
+        changesApplied: true,
+      };
+
+      if (publication.pullRequest) {
+        details.pullRequest = publication.pullRequest;
+      }
+
+      this.engine.updateJobDetails(jobId, details);
+      this.engine.updateProgress(jobId, 95);
+
+      job = this.engine.transitionJob(jobId, "completed");
+
+      return {
+        success: true,
+        job,
+        filesMigrated: proposals.length,
+        validationPassed: true,
+      };
+    } catch (error) {
+      const current = this.engine.getJob(jobId);
+
+      if (
+        transitionedToRunning &&
+        current?.status === "running"
+      ) {
+        this.engine.transitionJob(jobId, "failed", {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Publication failed.",
+        });
+      }
+
+      throw error;
+    } finally {
+      this.active.delete(jobId);
     }
   }
 }

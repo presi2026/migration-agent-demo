@@ -1,4 +1,3 @@
-cat > src/validator.js <<'EOF'
 "use strict";
 
 const fs = require("node:fs");
@@ -159,8 +158,18 @@ async function validateProposal({
     directory = fs.mkdtempSync(
       path.join(os.tmpdir(), "migration-validation-")
     );
+    fs.chmodSync(directory, 0o755);
 
-    const safePath = path.resolve(directory, filePath);
+    // Validate generated code using its target-language extension,
+    // not the original source file's extension.
+    const parsedPath = path.parse(filePath);
+    const validationPath =
+      language === "javascript" &&
+      ![".js", ".cjs", ".mjs"].includes(parsedPath.ext.toLowerCase())
+        ? path.join(parsedPath.dir, `${parsedPath.name}.js`)
+        : filePath;
+
+    const safePath = path.resolve(directory, validationPath);
     const relativePath = path.relative(directory, safePath);
 
     if (
@@ -177,8 +186,9 @@ async function validateProposal({
 
     fs.mkdirSync(path.dirname(safePath), {
       recursive: true,
-      mode: 0o700,
+      mode: 0o755,
     });
+    fs.chmodSync(path.dirname(safePath), 0o755);
 
     fs.writeFileSync(safePath, proposal, {
       encoding: "utf8",
